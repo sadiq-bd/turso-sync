@@ -56,13 +56,14 @@ nano ~/.config/turso-sync/config.json:
       "name": "production",
       "turso_url": "libsql://your-prod-db.turso.io",
       "turso_auth_token": "eyJhbGciOi...",
-      "local_db_path": "/var/lib/turso-backup/prod.db",   // optional
+      "local_db_path": "/var/lib/turso-backup/prod.db",
       "sync_interval": "60s"
     },
     {
       "name": "staging",
       "turso_url": "libsql://your-staging-db.turso.io",
       "turso_auth_token": "eyJhbGciOi...",
+      "local_db_path": "/var/lib/turso-backup/stag.db",
       "sync_interval": "5m"
     }
   ]
