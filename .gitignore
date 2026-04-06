@@ -1,0 +1,26 @@
+# Built binary
+turso-sync
+turso-sync.exe
+
+# Local SQLite replica files (these are your backups — never commit them!)
+*.db
+*.db-wal
+*.db-shm
+
+# Config file containing secrets
+config.json
+
+# Go build/temp files
+*.o
+*.a
+cover.out
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs (if you add logging later)
+*.log
+
