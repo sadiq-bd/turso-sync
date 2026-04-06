@@ -1,6 +1,11 @@
+<p align="left">
+  <img src="https://api.sadiq.workers.dev/app/github/repo/turso-sync/views" alt="Repo Views" />
+</p>
+
 # Turso Multi-DB Sync
 
 **Lightweight, reliable, incremental backup & sync engine for Turso databases using Embedded Replicas.**
+
 
 This tool keeps one or more local SQLite replicas in sync with your Turso cloud databases.  
 Only changed pages are transferred after the initial sync → very low bandwidth and cost.
