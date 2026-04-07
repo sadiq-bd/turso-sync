@@ -46,95 +46,169 @@ func main() {
 		wg.Add(1)
 		go func(cfg DBConfig) {
 			defer wg.Done()
-			startSyncForDB(ctx, cfg)
+			runWithReconnect(ctx, cfg)
 		}(dbCfg)
 	}
 
-	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
 	fmt.Println("\n🛑 Shutdown signal received. Stopping all sync engines...")
-	cancel()   // Tell all goroutines to stop
-	wg.Wait()  // Wait until they actually finish
-
+	cancel()
+	wg.Wait()
 	fmt.Println("✅ All sync engines stopped cleanly.")
-	fmt.Println("   Your local backups are safe.")
 }
 
-func startSyncForDB(ctx context.Context, cfg DBConfig) {
-	// Recover from any unexpected panic in this goroutine
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("❌ [%s] PANIC recovered: %v", cfg.Name, r)
+func runWithReconnect(ctx context.Context, cfg DBConfig) {
+	for {
+		if ctx.Err() != nil {
+			return
 		}
-	}()
 
-	// Parse sync interval
+		log.Printf("[%s] Starting / reconnecting...", cfg.Name)
+		err := runSyncOnce(ctx, cfg)
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		waitDuration := 5 * time.Second
+		if err != nil {
+			waitDuration = 10 * time.Second
+			log.Printf("⚠️  [%s] Sync session ended with error: %v → will reconnect in 10s", cfg.Name, err)
+		} else {
+			log.Printf("[%s] Sync session ended cleanly → reconnecting in 5s", cfg.Name)
+		}
+
+		select {
+		case <-time.After(waitDuration):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func runSyncOnce(ctx context.Context, cfg DBConfig) error {
 	syncInterval := 60 * time.Second
 	if cfg.SyncInterval != "" {
 		if d, err := time.ParseDuration(cfg.SyncInterval); err == nil {
 			syncInterval = d
-		} else {
-			log.Printf("Warning [%s]: Invalid sync_interval '%s' → using 60s", cfg.Name, cfg.SyncInterval)
 		}
 	}
 
-	// Default local path
 	if cfg.LocalDBPath == "" {
 		cfg.LocalDBPath = getDefaultLocalDBPath(cfg.Name)
 	}
 
-	log.Printf("[%s] Starting sync | Local: %s | Interval: %v", cfg.Name, cfg.LocalDBPath, syncInterval)
-
-	// Ensure directory exists
+	// Ensure local db directory exists
 	if err := os.MkdirAll(filepath.Dir(cfg.LocalDBPath), 0755); err != nil {
-		log.Printf("❌ [%s] Failed to create directory: %v", cfg.Name, err)
-		return
+		return fmt.Errorf("failed to create database directory: %w", err)
 	}
 
-	connector, err := libsql.NewEmbeddedReplicaConnector(
-		cfg.LocalDBPath,
-		cfg.TursoURL,
-		libsql.WithAuthToken(cfg.TursoAuthToken),
-		libsql.WithSyncInterval(syncInterval),
-	)
+	// Create connector with retry
+	connector, err := createConnectorWithRetry(ctx, cfg)
 	if err != nil {
-		log.Printf("❌ [%s] Failed to create connector: %v", cfg.Name, err)
-		return
+		return fmt.Errorf("failed to create connector: %w", err)
 	}
 	defer connector.Close()
 
 	db := sql.OpenDB(connector)
 	defer db.Close()
 
+	log.Printf("✅ [%s] Connected successfully", cfg.Name)
+
 	// Initial sync
 	log.Printf("[%s] Performing initial sync...", cfg.Name)
 	if _, err := connector.Sync(); err != nil {
-		log.Printf("⚠️  [%s] Initial sync failed (local file is still safe): %v", cfg.Name, err)
+		log.Printf("⚠️  [%s] Initial sync failed: %v", cfg.Name, err)
 	} else {
 		log.Printf("✅ [%s] Initial sync completed", cfg.Name)
 	}
 
-	log.Printf("✅ [%s] Background sync is now active", cfg.Name)
-
-	// Health monitor (stops when context is cancelled)
-	ticker := time.NewTicker(30 * time.Second)
+	// Health monitor & Manual Sync Loop
+	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
+
+	consecutiveFailures := 0
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[%s] Stopping health monitor", cfg.Name)
-			return
+			return nil
 		case <-ticker.C:
+			// 1. Health check local db
 			var count int
-			if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'").Scan(&count); err != nil {
-				log.Printf("Health check [%s] failed: %v", cfg.Name, err)
-			} else {
-				log.Printf("📊 [%s] Healthy (%d tables)", cfg.Name, count)
+			err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'").Scan(&count)
+
+			if err != nil {
+				consecutiveFailures++
+				log.Printf("⚠️  [%s] Local DB check failed (%d/3): %v", cfg.Name, consecutiveFailures, err)
+				if consecutiveFailures >= 3 {
+					return fmt.Errorf("too many local db check failures")
+				}
+				continue
 			}
+
+			// 2. Network Sync with timeout
+			syncChan := make(chan error, 1)
+			go func() {
+				_, syncErr := connector.Sync()
+				syncChan <- syncErr
+			}()
+
+			syncTimeout := syncInterval / 2
+			if syncTimeout < 10*time.Second {
+				syncTimeout = 10 * time.Second
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case syncErr := <-syncChan:
+				if syncErr != nil {
+					consecutiveFailures++
+					log.Printf("⚠️  [%s] Network Sync failed (%d/3): %v", cfg.Name, consecutiveFailures, syncErr)
+					if consecutiveFailures >= 3 {
+						return fmt.Errorf("too many network sync failures: %w", syncErr)
+					}
+				} else {
+					consecutiveFailures = 0
+					log.Printf("📊 [%s] Healthy & Synced (%d tables)", cfg.Name, count)
+				}
+			case <-time.After(syncTimeout):
+				consecutiveFailures++
+				log.Printf("⚠️  [%s] Network Sync timed out (%d/3)", cfg.Name, consecutiveFailures)
+				if consecutiveFailures >= 3 {
+					return fmt.Errorf("network sync persistently timed out")
+				}
+			}
+		}
+	}
+}
+
+func createConnectorWithRetry(ctx context.Context, cfg DBConfig) (*libsql.Connector, error) {
+	for attempt := 1; ; attempt++ {
+		connector, err := libsql.NewEmbeddedReplicaConnector(
+			cfg.LocalDBPath,
+			cfg.TursoURL,
+			libsql.WithAuthToken(cfg.TursoAuthToken),
+		)
+		if err == nil {
+			return connector, nil
+		}
+
+		log.Printf("⚠️  [%s] Connector attempt %d failed: %v", cfg.Name, attempt, err)
+
+		backoff := time.Duration(attempt*3) * time.Second
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 }
@@ -144,7 +218,7 @@ func loadConfig() Config {
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		log.Fatalf("❌ Could not read config file: %s\nError: %v\nPlease create the config.json file.", configPath, err)
+		log.Fatalf("❌ Could not read config file: %s\nPlease create it with your database configurations.\nError: %v", configPath, err)
 	}
 
 	var config Config
@@ -153,12 +227,12 @@ func loadConfig() Config {
 	}
 
 	// Basic validation
-	for i, db := range config.Databases {
-		if db.Name == "" {
-			db.Name = fmt.Sprintf("db-%d", i+1)
+	for i := range config.Databases {
+		if config.Databases[i].Name == "" {
+			config.Databases[i].Name = fmt.Sprintf("db-%d", i+1)
 		}
-		if db.TursoURL == "" || db.TursoAuthToken == "" {
-			log.Fatalf("❌ Database '%s' is missing turso_url or turso_auth_token", db.Name)
+		if config.Databases[i].TursoURL == "" || config.Databases[i].TursoAuthToken == "" {
+			log.Fatalf("❌ Database '%s' is missing turso_url or turso_auth_token", config.Databases[i].Name)
 		}
 	}
 
