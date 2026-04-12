@@ -1,5 +1,5 @@
 <p align="left">
-  <img src="https://api.sadiq.workers.dev/app/github/repo/turso-sync/views" alt="Repo Views" />
+  <img src="https://api.sadiq.workers.dev/app/github/repo/turso-sync/views?nocache" alt="Repo Views" />
 </p>
 
 # Turso Multi-DB Sync
